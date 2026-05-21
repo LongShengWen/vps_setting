@@ -515,6 +515,21 @@ apply_ipv6_runtime_sysctl() {
     fi
 }
 
+write_ipv6_sysctl_config() {
+    mkdir -p /etc/sysctl.d
+    cat > "$IPV6_SYSCTL_FILE" <<EOF
+net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv6.conf.default.disable_ipv6 = 0
+net.ipv6.conf.lo.disable_ipv6 = 0
+net.ipv6.conf.all.accept_ra = 2
+net.ipv6.conf.default.accept_ra = 2
+net.ipv6.conf.all.autoconf = 1
+net.ipv6.conf.default.autoconf = 1
+EOF
+
+    sysctl -p "$IPV6_SYSCTL_FILE" >/dev/null 2>&1
+}
+
 get_iface_mac_address() {
     local iface="$1"
     [ -n "$iface" ] || return 1
@@ -739,6 +754,198 @@ refresh_ipv6_address() {
     fi
 }
 
+get_oci_ipv6_metadata_address() {
+    local iface ipv6_info ipv6_addr ipv6_gw ipv6_subnet
+
+    iface="${1:-$(get_primary_network_iface)}"
+    [ -n "$iface" ] || return 1
+
+    ipv6_info=$(get_oci_vnic_ipv6_info "$iface") || return 1
+    IFS='|' read -r ipv6_addr ipv6_gw ipv6_subnet <<EOF
+$ipv6_info
+EOF
+
+    [ -n "$ipv6_addr" ] || return 1
+    printf '%s\n' "$ipv6_addr"
+}
+
+get_oci_ipv6_service_status() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "不支持"
+        return 0
+    fi
+
+    if is_systemd_service_active "$OCI_IPV6_SERVICE_NAME"; then
+        echo "运行中"
+    elif is_systemd_service_enabled "$OCI_IPV6_SERVICE_NAME"; then
+        echo "已启用"
+    elif has_systemd_service "$OCI_IPV6_SERVICE_NAME"; then
+        echo "未启动"
+    else
+        echo "未安装"
+    fi
+}
+
+write_oci_ipv6_apply_script() {
+    cat > "$OCI_IPV6_APPLY_SCRIPT" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+iface=$(ip route show default 2>/dev/null | awk '
+    {
+        for (i = 1; i <= NF; i++) {
+            if ($i == "dev") {
+                print $(i + 1)
+                exit
+            }
+        }
+    }
+')
+
+if [ -z "$iface" ]; then
+    iface=$(ip -o link show 2>/dev/null | awk -F': ' '
+        $2 !~ /^(lo|docker[0-9]*|veth.*|br-.*|virbr.*|tun.*|tap.*|wg.*|tailscale.*|zt.*|dummy.*)$/ {
+            print $2
+            exit
+        }
+    ')
+fi
+
+[ -n "$iface" ] || exit 1
+[ -r "/sys/class/net/${iface}/address" ] || exit 1
+
+mac=$(tr '[:lower:]' '[:upper:]' < "/sys/class/net/${iface}/address")
+
+ipv6_info=$(
+    curl -fsS --connect-timeout 3 --max-time 8 \
+        -H 'Authorization: Bearer Oracle' \
+        http://169.254.169.254/opc/v2/vnics/ 2>/dev/null | \
+        python3 - "$mac" <<'PY'
+import json
+import sys
+
+target_mac = sys.argv[1].strip().upper()
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+
+for item in data if isinstance(data, list) else []:
+    mac = str(item.get("macAddr", "")).strip().upper()
+    if mac != target_mac:
+        continue
+    ipv6_list = item.get("ipv6Addresses") or []
+    ipv6 = ipv6_list[0].strip() if ipv6_list else ""
+    gateway = str(item.get("ipv6VirtualRouterIp", "")).strip()
+    subnet = str(item.get("ipv6SubnetCidrBlock", "")).strip()
+    if ipv6:
+        print(f"{ipv6}|{gateway}|{subnet}")
+        sys.exit(0)
+
+sys.exit(1)
+PY
+)
+
+IFS='|' read -r ipv6_addr ipv6_gw ipv6_subnet <<EOF2
+$ipv6_info
+EOF2
+
+[ -n "${ipv6_addr:-}" ] || exit 1
+
+sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.all.accept_ra=2 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.default.accept_ra=2 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.all.autoconf=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.default.autoconf=1 >/dev/null 2>&1 || true
+sysctl -w "net.ipv6.conf.${iface}.disable_ipv6=0" >/dev/null 2>&1 || true
+sysctl -w "net.ipv6.conf.${iface}.accept_ra=2" >/dev/null 2>&1 || true
+sysctl -w "net.ipv6.conf.${iface}.autoconf=1" >/dev/null 2>&1 || true
+
+if ! ip -6 addr show dev "$iface" 2>/dev/null | grep -Fq "${ipv6_addr}/128"; then
+    ip -6 addr add "${ipv6_addr}/128" dev "$iface"
+fi
+
+[ -n "${ipv6_subnet:-}" ] && ip -6 route replace "$ipv6_subnet" dev "$iface" metric 256 >/dev/null 2>&1 || true
+[ -n "${ipv6_gw:-}" ] && ip -6 route replace default via "$ipv6_gw" dev "$iface" metric 512 >/dev/null 2>&1 || true
+EOF
+
+    chmod 755 "$OCI_IPV6_APPLY_SCRIPT"
+}
+
+write_oci_ipv6_service_unit() {
+    cat > "$OCI_IPV6_SERVICE_PATH" <<EOF
+[Unit]
+Description=VPS Suite OCI IPv6 Bootstrap
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=${OCI_IPV6_APPLY_SCRIPT}
+
+[Service]
+Type=oneshot
+ExecStart=${OCI_IPV6_APPLY_SCRIPT}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+install_oci_ipv6_service() {
+    local iface ipv6_info ipv6_addr ipv6_gw ipv6_subnet current_ipv6
+
+    command -v systemctl >/dev/null 2>&1 || {
+        msg_err "当前系统未提供 systemd，无法安装甲骨文 IPv6 服务。"
+        return 1
+    }
+
+    iface=$(get_primary_network_iface)
+    [ -n "$iface" ] || {
+        msg_err "未检测到主网卡。"
+        return 1
+    }
+
+    ipv6_info=$(get_oci_vnic_ipv6_info "$iface") || {
+        msg_err "未从甲骨文元数据拿到 IPv6。请先在 OCI 控制台为主网卡分配 IPv6。"
+        return 1
+    }
+    IFS='|' read -r ipv6_addr ipv6_gw ipv6_subnet <<EOF
+$ipv6_info
+EOF
+
+    [ -n "$ipv6_addr" ] || {
+        msg_err "甲骨文元数据中没有可用的 IPv6 地址。"
+        return 1
+    }
+
+    write_ipv6_sysctl_config || {
+        msg_err "IPv6 内核参数写入失败。"
+        return 1
+    }
+
+    apply_ipv6_runtime_sysctl "$iface"
+    write_oci_ipv6_apply_script || return 1
+    write_oci_ipv6_service_unit || return 1
+
+    systemctl daemon-reload || return 1
+    systemctl enable --now "$OCI_IPV6_SERVICE_NAME" >/dev/null 2>&1 || {
+        msg_err "甲骨文 IPv6 服务启动失败。"
+        return 1
+    }
+
+    apply_oci_ipv6_runtime_fix "$iface" || true
+    sleep 1
+    current_ipv6=$(get_current_ipv6_address "$iface")
+
+    msg_ok "甲骨文 IPv6 服务已启用。"
+    msg_info "网卡: ${iface}"
+    msg_info "元数据 IPv6: ${ipv6_addr}"
+    [ -n "$ipv6_gw" ] && msg_info "IPv6 网关: ${ipv6_gw}"
+    [ -n "$current_ipv6" ] && msg_info "当前 IPv6: ${current_ipv6}"
+    return 0
+}
+
 repair_ipv6_autoconf() {
     local iface before_ipv6 after_ipv6
     local netplan_fixed=0 nmcli_fixed=0 ifupdown_fixed=0 oci_runtime_fixed=0
@@ -751,18 +958,7 @@ repair_ipv6_autoconf() {
 
     before_ipv6=$(get_current_ipv6_address "$iface")
 
-    mkdir -p /etc/sysctl.d
-    cat > "$IPV6_SYSCTL_FILE" <<EOF
-net.ipv6.conf.all.disable_ipv6 = 0
-net.ipv6.conf.default.disable_ipv6 = 0
-net.ipv6.conf.lo.disable_ipv6 = 0
-net.ipv6.conf.all.accept_ra = 2
-net.ipv6.conf.default.accept_ra = 2
-net.ipv6.conf.all.autoconf = 1
-net.ipv6.conf.default.autoconf = 1
-EOF
-
-    sysctl -p "$IPV6_SYSCTL_FILE" >/dev/null 2>&1 || {
+    write_ipv6_sysctl_config || {
         msg_err "IPv6 内核参数加载失败。"
         return 1
     }

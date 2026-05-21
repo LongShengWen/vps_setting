@@ -276,6 +276,42 @@ menu_network_performance() {
     done
 }
 
+menu_oracle_cloud_services() {
+    local sub menu_action oci_meta_ipv6 oci_service_status
+
+    while true; do
+        clear
+        oci_meta_ipv6=$(get_oci_ipv6_metadata_address 2>/dev/null || echo "未分配")
+        oci_service_status=$(get_oci_ipv6_service_status)
+
+        menu_header "9. 甲骨文服务"
+        status_pair "元数据 IPv6" "$oci_meta_ipv6"
+        status_pair "IPv6 服务" "$oci_service_status"
+        draw_line
+        menu_pair "[1] 添加 OCI IPv6 开机服务"
+        menu_pair "[2] 修复当前 OCI IPv6"
+        menu_footer_back
+        menu_read_submenu_action sub menu_action
+        case "$menu_action" in
+            continue) ;;
+            return) return ;;
+            retry) continue ;;
+            back) break ;;
+        esac
+        case $sub in
+            1)
+                confirm "安装并启动甲骨文 IPv6 开机服务" && {
+                    install_oci_ipv6_service
+                } ;;
+            2)
+                confirm "立即修复当前甲骨文 IPv6" && {
+                    repair_ipv6_autoconf
+                } ;;
+        esac
+        pause
+    done
+}
+
 firewall_open_port() {
     local backend="${1:-$(detect_firewall_backend)}"
     local proto="$2"

@@ -38,6 +38,7 @@ while true; do
     menu_pair "[3] 系统优化 >>" "[4] 防火墙管理 >>"
     menu_pair "[5] 常用工具 >>" "[6] 机器测试 >>"
     menu_pair "[7] DD系统 >>" "[8] 系统信息 >>"
+    menu_pair "[9] 甲骨文服务 >>"
 
     menu_section "快捷入口"
     menu_pair "[A] 全自动一键部署" "[0] 退出管理系统"
@@ -65,6 +66,7 @@ while true; do
         6) menu_machine_tests ;;
         7) install_system_tools ;;
         8) show_system_report ;;
+        9) menu_oracle_cloud_services ;;
         A|a)
             confirm "执行全自动一键部署(已内置SSH/用户/iptables/ping初始化逻辑)" && \
                 run_inlined_auto_deploy
