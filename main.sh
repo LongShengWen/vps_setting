@@ -48,8 +48,8 @@ while true; do
     status_pair "MEM" "${DASH_MEM:-"0.0"}"
     status_pair "IP" "${DASH_IP:-"N/A"}"
     draw_line
-    menu_read_standard_choice choice
-    local_menu_status=$?
+    local_menu_status=$MENU_RESULT_CONTINUE
+    menu_read_standard_choice choice || local_menu_status=$?
     case "$local_menu_status" in
         "$MENU_RESULT_CONTINUE") ;;
         "$MENU_RESULT_EXIT_ALL"|"$MENU_RESULT_BACK") exit 0 ;;

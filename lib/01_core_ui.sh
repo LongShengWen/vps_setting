@@ -420,13 +420,13 @@ menu_footer_back() {
 }
 
 read_menu_choice() {
-    local __resultvar="$1"
+    local -n __resultref="$1"
     local prompt="${2:-请输入选择:}"
     local __choice_value
 
     msg_prompt "$prompt"
     IFS= read -r __choice_value
-    printf -v "$__resultvar" '%s' "$__choice_value"
+    __resultref="$__choice_value"
 }
 
 handle_standard_menu_control() {
@@ -450,35 +450,34 @@ handle_standard_menu_control() {
 }
 
 menu_read_standard_choice() {
-    local __resultvar="$1"
+    local -n __resultref="$1"
     local prompt="${2:-请输入选择:}"
-    local menu_choice_buffer
+    local menu_choice_value
 
-    read_menu_choice menu_choice_buffer "$prompt"
-    printf -v "$__resultvar" '%s' "$menu_choice_buffer"
-    handle_standard_menu_control "$menu_choice_buffer"
+    read_menu_choice menu_choice_value "$prompt"
+    __resultref="$menu_choice_value"
+    handle_standard_menu_control "$menu_choice_value"
 }
 
 menu_read_submenu_action() {
-    local __choicevar="$1"
-    local __actionvar="$2"
+    local -n __choiceref="$1"
+    local -n __actionref="$2"
     local prompt="${3:-请输入选择:}"
     local menu_choice_buffer
-    local menu_status
-    local menu_action="continue"
+    local menu_status="$MENU_RESULT_CONTINUE"
+    local submenu_action_value="continue"
 
-    menu_read_standard_choice menu_choice_buffer "$prompt"
-    menu_status=$?
+    menu_read_standard_choice menu_choice_buffer "$prompt" || menu_status=$?
 
     case "$menu_status" in
-        "$MENU_RESULT_CONTINUE") menu_action="continue" ;;
-        "$MENU_RESULT_EXIT_ALL") menu_action="return" ;;
-        "$MENU_RESULT_RETRY") menu_action="retry" ;;
-        "$MENU_RESULT_BACK") menu_action="back" ;;
+        "$MENU_RESULT_CONTINUE") submenu_action_value="continue" ;;
+        "$MENU_RESULT_EXIT_ALL") submenu_action_value="return" ;;
+        "$MENU_RESULT_RETRY") submenu_action_value="retry" ;;
+        "$MENU_RESULT_BACK") submenu_action_value="back" ;;
     esac
 
-    printf -v "$__choicevar" '%s' "$menu_choice_buffer"
-    printf -v "$__actionvar" '%s' "$menu_action"
+    __choiceref="$menu_choice_buffer"
+    __actionref="$submenu_action_value"
 }
 
 run_confirmed_action() {
