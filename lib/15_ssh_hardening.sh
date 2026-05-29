@@ -293,8 +293,18 @@ get_fail2ban_banaction() {
     local backend
     backend=$(detect_firewall_backend 2>/dev/null || true)
 
-    if [ "$backend" = "nft" ] && [ -f /etc/fail2ban/action.d/nftables.conf ]; then
-        echo "nftables"
+    if [ "$backend" = "nft" ]; then
+        if [ -f /etc/fail2ban/action.d/nftables-multiport.conf ]; then
+            echo "nftables-multiport"
+        elif [ -f /etc/fail2ban/action.d/nftables.conf ]; then
+            echo "nftables"
+        else
+            echo "iptables-multiport"
+        fi
+    elif [ -f /etc/fail2ban/action.d/iptables-multiport.conf ]; then
+        echo "iptables-multiport"
+    elif [ -f /etc/fail2ban/action.d/iptables-allports.conf ]; then
+        echo "iptables-allports"
     else
         echo "iptables-multiport"
     fi
@@ -329,14 +339,19 @@ bantime = 1h
 EOF
     if [ "$f2b_backend" = "systemd" ]; then
         cat >> "$FAIL2BAN_SSH_JAIL_FILE" <<'EOF'
-journalmatch = _SYSTEMD_UNIT=ssh.service + _SYSTEMD_UNIT=sshd.service + _COMM=sshd
+journalmatch = _COMM=sshd
 EOF
     fi
 
-    if ! fail2ban-client -d >/dev/null 2>&1; then
+    local f2b_check_log
+    f2b_check_log=$(mktemp) || f2b_check_log="/tmp/fail2ban-check.log"
+    if ! fail2ban-client -d >"$f2b_check_log" 2>&1; then
         msg_err "Fail2Ban 配置校验失败，请检查 ${FAIL2BAN_SSH_JAIL_FILE}"
+        tail -n 40 "$f2b_check_log" 2>/dev/null || true
+        rm -f "$f2b_check_log"
         return 1
     fi
+    rm -f "$f2b_check_log"
 
     systemctl enable fail2ban >/dev/null 2>&1 || true
     if systemctl restart fail2ban >/dev/null 2>&1 || \
