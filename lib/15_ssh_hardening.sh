@@ -276,9 +276,34 @@ ensure_fail2ban_installed() {
     command -v fail2ban-client >/dev/null 2>&1
 }
 
+get_fail2ban_sshd_backend() {
+    if command -v journalctl >/dev/null 2>&1 && \
+       command -v python3 >/dev/null 2>&1 && \
+       python3 - <<'PY' >/dev/null 2>&1
+import systemd.journal
+PY
+    then
+        echo "systemd"
+    else
+        echo "auto"
+    fi
+}
+
+get_fail2ban_banaction() {
+    local backend
+    backend=$(detect_firewall_backend 2>/dev/null || true)
+
+    if [ "$backend" = "nft" ] && [ -f /etc/fail2ban/action.d/nftables.conf ]; then
+        echo "nftables"
+    else
+        echo "iptables-multiport"
+    fi
+}
+
 # 更新 fail2ban 中 sshd jail 的端口配置并重启/重载 fail2ban
 update_fail2ban_ssh_port() {
     local ports="$1"
+    local f2b_backend f2b_banaction
     [ -z "$ports" ] && ports=$(get_current_ssh_ports_csv)
 
     if ! command -v fail2ban-client &>/dev/null; then
@@ -286,16 +311,27 @@ update_fail2ban_ssh_port() {
         return 1
     fi
 
+    f2b_backend=$(get_fail2ban_sshd_backend)
+    f2b_banaction=$(get_fail2ban_banaction)
+
     mkdir -p /etc/fail2ban/jail.d
     cat > "$FAIL2BAN_SSH_JAIL_FILE" <<EOF
 [sshd]
 enabled = true
+filter = sshd
 port = ${ports}
-backend = auto
+logpath = %(sshd_log)s
+backend = ${f2b_backend}
+banaction = ${f2b_banaction}
 maxretry = 5
 findtime = 10m
 bantime = 1h
 EOF
+    if [ "$f2b_backend" = "systemd" ]; then
+        cat >> "$FAIL2BAN_SSH_JAIL_FILE" <<'EOF'
+journalmatch = _SYSTEMD_UNIT=ssh.service + _SYSTEMD_UNIT=sshd.service + _COMM=sshd
+EOF
+    fi
 
     if ! fail2ban-client -d >/dev/null 2>&1; then
         msg_err "Fail2Ban 配置校验失败，请检查 ${FAIL2BAN_SSH_JAIL_FILE}"
@@ -318,4 +354,3 @@ install_and_configure_fail2ban() {
     ensure_fail2ban_installed || return 1
     update_fail2ban_ssh_port "$(get_current_ssh_ports_csv)"
 }
-
