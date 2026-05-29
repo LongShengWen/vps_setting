@@ -354,3 +354,119 @@ install_and_configure_fail2ban() {
     ensure_fail2ban_installed || return 1
     update_fail2ban_ssh_port "$(get_current_ssh_ports_csv)"
 }
+
+show_fail2ban_status_detail() {
+    local cfg_file="${FAIL2BAN_SSH_JAIL_FILE:-/etc/fail2ban/jail.d/vps-init-suite-sshd.local}"
+    local service_active="未知" service_enabled="未知" server_ping="失败"
+    local config_check="未执行" jails="" sshd_loaded="否" effective="否"
+    local cfg_port="未配置" cfg_backend="未配置" cfg_banaction="未配置"
+    local current_failed="-" total_failed="-" current_banned="-" total_banned="-"
+    local banned_ips="无" backend="unknown" firewall_rules="" recent_events=""
+    local sshd_status=""
+
+    clear
+    menu_header "Fail2Ban 状态与封禁详情"
+
+    if ! command -v fail2ban-client >/dev/null 2>&1; then
+        status_pair "安装状态" "未安装"
+        status_pair "脚本配置" "$([ -f "$cfg_file" ] && echo "存在：$cfg_file" || echo "不存在")"
+        draw_line
+        msg_warn "Fail2Ban 未安装，当前未生效。"
+        return 1
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        service_active=$(systemctl is-active fail2ban 2>/dev/null || echo "inactive")
+        service_enabled=$(systemctl is-enabled fail2ban 2>/dev/null || echo "disabled")
+    fi
+
+    fail2ban-client ping >/dev/null 2>&1 && server_ping="正常"
+    fail2ban-client -d >/dev/null 2>&1 && config_check="通过" || config_check="失败"
+
+    if [ -f "$cfg_file" ]; then
+        cfg_port=$(awk -F= '/^[[:space:]]*port[[:space:]]*=/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' "$cfg_file" | tail -n 1)
+        cfg_backend=$(awk -F= '/^[[:space:]]*backend[[:space:]]*=/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' "$cfg_file" | tail -n 1)
+        cfg_banaction=$(awk -F= '/^[[:space:]]*banaction[[:space:]]*=/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' "$cfg_file" | tail -n 1)
+        cfg_port=${cfg_port:-未配置}
+        cfg_backend=${cfg_backend:-未配置}
+        cfg_banaction=${cfg_banaction:-未配置}
+    fi
+
+    jails=$(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr ',' ' ' | xargs 2>/dev/null || true)
+    if printf ' %s ' "$jails" | grep -q ' sshd '; then
+        sshd_loaded="是"
+        sshd_status=$(fail2ban-client status sshd 2>/dev/null || true)
+        current_failed=$(printf '%s\n' "$sshd_status" | awk -F: '/Currently failed:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
+        total_failed=$(printf '%s\n' "$sshd_status" | awk -F: '/Total failed:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
+        current_banned=$(printf '%s\n' "$sshd_status" | awk -F: '/Currently banned:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
+        total_banned=$(printf '%s\n' "$sshd_status" | awk -F: '/Total banned:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
+        banned_ips=$(printf '%s\n' "$sshd_status" | awk -F: '/Banned IP list:/ {sub(/^[^:]*:[ \t]*/, ""); print; exit}')
+        current_failed=${current_failed:-0}
+        total_failed=${total_failed:-0}
+        current_banned=${current_banned:-0}
+        total_banned=${total_banned:-0}
+        banned_ips=${banned_ips:-无}
+    fi
+
+    if [ "$server_ping" = "正常" ] && [ "$sshd_loaded" = "是" ] && [ "$config_check" = "通过" ]; then
+        effective="是"
+    fi
+
+    backend=$(detect_firewall_backend 2>/dev/null || echo "unknown")
+    if [ "$backend" = "nft" ] && command -v nft >/dev/null 2>&1; then
+        firewall_rules=$(nft list ruleset 2>/dev/null | grep -i 'f2b' | head -n 20 || true)
+    elif command -v iptables >/dev/null 2>&1; then
+        firewall_rules=$(iptables -S 2>/dev/null | grep -i 'f2b' | head -n 20 || true)
+        if command -v ip6tables >/dev/null 2>&1; then
+            firewall_rules="${firewall_rules}"$'\n'"$(ip6tables -S 2>/dev/null | grep -i 'f2b' | head -n 20 || true)"
+        fi
+    fi
+    firewall_rules=$(printf '%s\n' "$firewall_rules" | awk 'NF')
+
+    recent_events=$(
+        {
+            journalctl -u fail2ban --no-pager -n 120 2>/dev/null || true
+            [ -f /var/log/fail2ban.log ] && tail -n 120 /var/log/fail2ban.log 2>/dev/null || true
+        } | grep -Ei "\\[sshd\\].*(Ban|Unban)|Jail 'sshd'|Jail \"sshd\"" | tail -n 20 || true
+    )
+
+    status_pair "安装状态" "已安装"
+    status_pair "服务状态" "${service_active}"
+    status_pair "开机启动" "${service_enabled}"
+    status_pair "客户端连接" "${server_ping}"
+    status_pair "配置校验" "${config_check}"
+    status_pair "sshd jail" "${sshd_loaded}"
+    status_pair "当前生效" "${effective}"
+    draw_line
+
+    menu_section "脚本配置"
+    status_pair "配置文件" "$([ -f "$cfg_file" ] && echo "$cfg_file" || echo "不存在")"
+    status_pair "SSH端口" "${cfg_port}"
+    status_pair "日志后端" "${cfg_backend}"
+    status_pair "封禁动作" "${cfg_banaction}"
+    status_pair "防火墙模式" "${backend}"
+    draw_line
+
+    menu_section "封禁详情"
+    status_pair "当前失败" "${current_failed}"
+    status_pair "累计失败" "${total_failed}"
+    status_pair "当前封禁" "${current_banned}"
+    status_pair "累计封禁" "${total_banned}"
+    status_pair "封禁IP" "${banned_ips}"
+    draw_line
+
+    menu_section "防火墙规则"
+    if [ -n "$firewall_rules" ]; then
+        printf '%s\n' "$firewall_rules"
+    else
+        msg_info "未发现 f2b 规则。未触发封禁或 action 尚未创建规则时可能出现该状态。"
+    fi
+    draw_line
+
+    menu_section "近期事件"
+    if [ -n "$recent_events" ]; then
+        printf '%s\n' "$recent_events"
+    else
+        msg_info "未发现近期 Ban / Unban / sshd jail 事件。"
+    fi
+}

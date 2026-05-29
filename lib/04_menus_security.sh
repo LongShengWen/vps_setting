@@ -66,10 +66,18 @@ menu_security_hardening() {
         status_pair "SSH_PORT" "$(get_current_ssh_ports_csv)"
         status_pair "ROOT_LOGIN" "${root_s:-"yes"}"
         draw_line
+
+        menu_section "用户与 SSH"
         menu_pair "[1] 创建管理用户" "[2] 修改SSH登录端口"
         menu_pair "[3] 允许Root登录" "[4] 禁用Root登录"
         menu_pair "[5] 允许密码登录" "[6] 禁用密码登录"
-        menu_pair "[7] 配置Fail2Ban" "[8] 一键整合SSH / 用户 / 防火墙"
+
+        menu_section "Fail2Ban"
+        menu_pair "[7] 安装/配置Fail2Ban" "[9] 查看状态/封禁详情"
+        menu_pair "[A] 卸载Fail2Ban"
+
+        menu_section "整合初始化"
+        menu_pair "[8] 一键整合SSH / 用户 / 防火墙"
         menu_footer_back
         menu_read_submenu_action sub menu_action
         case "$menu_action" in
@@ -200,6 +208,10 @@ menu_security_hardening() {
                 } ;;
             8)
                 run_integrated_ssh_user_firewall_init ;;
+            9)
+                show_fail2ban_status_detail ;;
+            A|a)
+                run_confirmed_action "卸载Fail2Ban（删除配置需二次确认）" uninstall_fail2ban ;;
         esac
         pause
     done

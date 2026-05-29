@@ -148,6 +148,13 @@ get_menu_item_status_simple() {
                 printf '%s\n' "未安装"
             fi
             ;;
+        fail2ban)
+            if command -v fail2ban-client >/dev/null 2>&1 || [ -d /etc/fail2ban ]; then
+                printf '%s\n' "已安装"
+            else
+                printf '%s\n' "未安装"
+            fi
+            ;;
         *)
             printf '%s\n' "-"
             ;;
@@ -355,4 +362,54 @@ uninstall_nginx() {
     fi
 
     msg_ok "Nginx 卸载流程已完成。"
+}
+
+uninstall_fail2ban() {
+    local pkg_mgr
+    local installed_pkgs=()
+    local pkg_list=(fail2ban fail2ban-server fail2ban-systemd)
+
+    pkg_mgr=$(get_pkg_manager)
+    [ -n "$pkg_mgr" ] || {
+        msg_err "未识别到受支持的包管理器，无法自动卸载 Fail2Ban。"
+        return 1
+    }
+
+    if command -v fail2ban-client >/dev/null 2>&1; then
+        fail2ban-client unban --all >/dev/null 2>&1 || true
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop fail2ban >/dev/null 2>&1 || true
+        systemctl disable fail2ban >/dev/null 2>&1 || true
+    else
+        service fail2ban stop >/dev/null 2>&1 || true
+    fi
+
+    rm -f "$FAIL2BAN_SSH_JAIL_FILE"
+
+    mapfile -t installed_pkgs < <(filter_installed_packages "${pkg_list[@]}" | awk 'NF')
+    if [ "${#installed_pkgs[@]}" -gt 0 ]; then
+        msg_info "准备卸载 Fail2Ban 软件包：${installed_pkgs[*]}"
+        pkg_remove "${installed_pkgs[@]}" || {
+            msg_err "Fail2Ban 软件包卸载失败。"
+            return 1
+        }
+        [ "$pkg_mgr" = "apt" ] && apt-get autoremove --purge -y >/dev/null 2>&1 || true
+    else
+        msg_info "未检测到已安装的 Fail2Ban 软件包。"
+    fi
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed >/dev/null 2>&1 || true
+
+    if confirm "是否同时删除 Fail2Ban 配置、数据库和日志? (/etc/fail2ban /var/lib/fail2ban /var/log/fail2ban.log)"; then
+        rm -rf /etc/fail2ban /var/lib/fail2ban
+        rm -f /var/log/fail2ban.log
+        msg_ok "Fail2Ban 配置、数据库和日志已删除。"
+    else
+        msg_warn "已保留 Fail2Ban 配置、数据库和日志。"
+    fi
+
+    msg_ok "Fail2Ban 卸载流程已完成。"
 }
