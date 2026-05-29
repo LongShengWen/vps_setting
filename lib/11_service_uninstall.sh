@@ -386,7 +386,7 @@ uninstall_fail2ban() {
         service fail2ban stop >/dev/null 2>&1 || true
     fi
 
-    rm -f "$FAIL2BAN_SSH_JAIL_FILE"
+    remove_fail2ban_managed_jail_local >/dev/null 2>&1 || true
 
     mapfile -t installed_pkgs < <(filter_installed_packages "${pkg_list[@]}" | awk 'NF')
     if [ "${#installed_pkgs[@]}" -gt 0 ]; then

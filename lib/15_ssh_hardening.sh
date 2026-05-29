@@ -310,25 +310,36 @@ get_fail2ban_banaction() {
     fi
 }
 
-cleanup_legacy_fail2ban_jail_local() {
-    local jail_local="/etc/fail2ban/jail.local"
-    local backup_file tmp_file
+write_fail2ban_jail_local() {
+    local ports="$1"
+    local f2b_backend="$2"
+    local f2b_banaction="$3"
+    local jail_local="${FAIL2BAN_SSH_JAIL_FILE:-/etc/fail2ban/jail.local}"
+    local legacy_jaild="${FAIL2BAN_LEGACY_JAILD_FILE:-/etc/fail2ban/jail.d/vps-init-suite-sshd.local}"
+    local backup_file tmp_file legacy_backup
 
-    [ -f "$jail_local" ] || return 0
-    command -v python3 >/dev/null 2>&1 || return 0
-
-    if ! grep -Eq '#DEFAULT-START|action[[:space:]]*=[[:space:]]*%\(action_mwl\)s|banaction[[:space:]]*=[[:space:]]*iptables-allports|^[[:space:]]*port[[:space:]]*=[[:space:]]*22([[:space:]]|$)' "$jail_local"; then
-        return 0
-    fi
-
-    backup_file="${jail_local}.bak.$(date +%F_%H%M%S)"
-    cp -af "$jail_local" "$backup_file" || {
-        msg_err "备份 ${jail_local} 失败，跳过旧配置迁移。"
+    mkdir -p /etc/fail2ban
+    command -v python3 >/dev/null 2>&1 || {
+        msg_err "未检测到 python3，无法安全更新 ${jail_local}。"
         return 1
     }
 
+    if [ -f "$jail_local" ]; then
+        backup_file="${jail_local}.bak.$(date +%F_%H%M%S)"
+        cp -af "$jail_local" "$backup_file" || {
+            msg_err "备份 ${jail_local} 失败。"
+            return 1
+        }
+    else
+        backup_file="新建文件"
+        : > "$jail_local" || {
+            msg_err "创建 ${jail_local} 失败。"
+            return 1
+        }
+    fi
+
     tmp_file=$(mktemp) || {
-        msg_err "创建临时文件失败，跳过旧配置迁移。"
+        msg_err "创建临时文件失败，无法更新 ${jail_local}。"
         return 1
     }
 
@@ -341,21 +352,32 @@ src = Path(sys.argv[1])
 dst = Path(sys.argv[2])
 lines = src.read_text(errors="ignore").splitlines(True)
 
-# 旧脚本写入的 DEFAULT 托管块：
-#   #DEFAULT-START ... #DEFAULT-END
-without_default = []
+out = []
+in_managed = False
 in_default_block = False
+
 for line in lines:
-    if line.strip() == "#DEFAULT-START":
+    stripped = line.strip()
+    if stripped == "# VPS init suite migrated legacy [sshd] block to jail.d/vps-init-suite-sshd.local":
+        continue
+    if stripped == "# VPS-INIT-SUITE-FAIL2BAN-START":
+        in_managed = True
+        continue
+    if in_managed:
+        if stripped == "# VPS-INIT-SUITE-FAIL2BAN-END":
+            in_managed = False
+        continue
+    if stripped == "#DEFAULT-START":
         in_default_block = True
         continue
     if in_default_block:
-        if line.strip() == "#DEFAULT-END":
+        if stripped == "#DEFAULT-END":
             in_default_block = False
         continue
-    without_default.append(line)
+    out.append(line)
 
 sections = []
+prelude = []
 current_header = None
 current_body = []
 
@@ -363,53 +385,65 @@ def push_section():
     if current_header is not None:
         sections.append((current_header, current_body.copy()))
 
-for line in without_default:
+for line in out:
     if re.match(r"^\s*\[[^]]+\]\s*$", line):
         push_section()
         current_header = line
         current_body = []
     else:
         if current_header is None:
-            sections.append((None, [line]))
+            prelude.append(line)
         else:
             current_body.append(line)
 push_section()
 
-out = []
+result = []
+result.extend(prelude)
 for header, body in sections:
-    if header is None:
-        out.extend(body)
-        continue
-
     name = header.strip().strip("[]").strip().lower()
-    body_text = "".join(body)
-
-    # 仅迁移旧脚本常见 sshd 配置，避免长期保留 port=22/action_mwl/iptables-allports 覆盖当前配置。
-    legacy_sshd = (
-        name == "sshd"
-        and (
-            re.search(r"(?mi)^\s*action\s*=\s*%\(action_mwl\)s\s*$", body_text)
-            or re.search(r"(?mi)^\s*banaction\s*=\s*iptables-allports\s*$", body_text)
-            or re.search(r"(?mi)^\s*port\s*=\s*22\s*$", body_text)
-        )
-    )
-    if legacy_sshd:
-        out.append("# VPS init suite migrated legacy [sshd] block to jail.d/vps-init-suite-sshd.local\n")
+    if name == "sshd":
+        result.append("# VPS init suite disabled previous [sshd] block; managed block is appended below.\n")
         for legacy_line in [header, *body]:
             if legacy_line.strip():
-                out.append("# " + legacy_line)
+                result.append("# " + legacy_line)
             else:
-                out.append(legacy_line)
+                result.append(legacy_line)
+        if result and not result[-1].endswith("\n"):
+            result[-1] += "\n"
         continue
+    result.append(header)
+    result.extend(body)
 
-    out.append(header)
-    out.extend(body)
-
-dst.write_text("".join(out))
+text = "".join(result).rstrip() + "\n\n"
+dst.write_text(text)
 PY
         rm -f "$tmp_file"
         return 1
     }
+
+    cat >> "$tmp_file" <<EOF
+# VPS-INIT-SUITE-FAIL2BAN-START
+[sshd]
+enabled = true
+filter = sshd
+port = ${ports}
+protocol = tcp
+logpath = %(sshd_log)s
+backend = ${f2b_backend}
+banaction = ${f2b_banaction}
+action = %(action_)s
+maxretry = 5
+findtime = 10m
+bantime = 1h
+EOF
+    if [ "$f2b_backend" = "systemd" ]; then
+        cat >> "$tmp_file" <<'EOF'
+journalmatch = _COMM=sshd
+EOF
+    fi
+    cat >> "$tmp_file" <<'EOF'
+# VPS-INIT-SUITE-FAIL2BAN-END
+EOF
 
     cat "$tmp_file" > "$jail_local" || {
         rm -f "$tmp_file"
@@ -417,7 +451,55 @@ PY
         return 1
     }
     rm -f "$tmp_file"
-    msg_ok "已迁移旧 Fail2Ban 配置，备份：${backup_file}"
+
+    local legacy_candidate
+    for legacy_candidate in "$legacy_jaild" "${legacy_jaild}".*; do
+        [ -f "$legacy_candidate" ] || continue
+        mkdir -p /var/backups/fail2ban 2>/dev/null || true
+        legacy_backup="/var/backups/fail2ban/$(basename "$legacy_candidate").disabled.$(date +%F_%H%M%S)"
+        mv "$legacy_candidate" "$legacy_backup" 2>/dev/null || rm -f "$legacy_candidate"
+        msg_ok "已停用旧独立配置文件：${legacy_backup}"
+    done
+
+    msg_ok "Fail2Ban SSH 配置已写入 ${jail_local}（备份：${backup_file}）"
+}
+
+remove_fail2ban_managed_jail_local() {
+    local jail_local="${FAIL2BAN_SSH_JAIL_FILE:-/etc/fail2ban/jail.local}"
+    local legacy_jaild="${FAIL2BAN_LEGACY_JAILD_FILE:-/etc/fail2ban/jail.d/vps-init-suite-sshd.local}"
+    local backup_file tmp_file
+
+    [ -f "$jail_local" ] || { rm -f "$legacy_jaild"; return 0; }
+    command -v python3 >/dev/null 2>&1 || return 0
+
+    backup_file="${jail_local}.bak.$(date +%F_%H%M%S)"
+    cp -af "$jail_local" "$backup_file" || return 1
+    tmp_file=$(mktemp) || return 1
+
+    python3 - "$jail_local" "$tmp_file" <<'PY' || { rm -f "$tmp_file"; return 1; }
+import sys
+from pathlib import Path
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+lines = src.read_text(errors="ignore").splitlines(True)
+out = []
+in_managed = False
+for line in lines:
+    stripped = line.strip()
+    if stripped == "# VPS-INIT-SUITE-FAIL2BAN-START":
+        in_managed = True
+        continue
+    if in_managed:
+        if stripped == "# VPS-INIT-SUITE-FAIL2BAN-END":
+            in_managed = False
+        continue
+    out.append(line)
+dst.write_text("".join(out).rstrip() + "\n")
+PY
+    cat "$tmp_file" > "$jail_local" || { rm -f "$tmp_file"; return 1; }
+    rm -f "$tmp_file"
+    rm -f "$legacy_jaild" "${legacy_jaild}".*
+    msg_ok "已移除 Fail2Ban 托管配置（备份：${backup_file}）"
 }
 
 # 更新 fail2ban 中 sshd jail 的端口配置并重启/重载 fail2ban
@@ -434,28 +516,7 @@ update_fail2ban_ssh_port() {
     f2b_backend=$(get_fail2ban_sshd_backend)
     f2b_banaction=$(get_fail2ban_banaction)
 
-    cleanup_legacy_fail2ban_jail_local || return 1
-
-    mkdir -p /etc/fail2ban/jail.d
-    cat > "$FAIL2BAN_SSH_JAIL_FILE" <<EOF
-[sshd]
-enabled = true
-filter = sshd
-port = ${ports}
-protocol = tcp
-logpath = %(sshd_log)s
-backend = ${f2b_backend}
-banaction = ${f2b_banaction}
-action = %(action_)s
-maxretry = 5
-findtime = 10m
-bantime = 1h
-EOF
-    if [ "$f2b_backend" = "systemd" ]; then
-        cat >> "$FAIL2BAN_SSH_JAIL_FILE" <<'EOF'
-journalmatch = _COMM=sshd
-EOF
-    fi
+    write_fail2ban_jail_local "$ports" "$f2b_backend" "$f2b_banaction" || return 1
 
     local f2b_check_log
     f2b_check_log=$(mktemp) || f2b_check_log="/tmp/fail2ban-check.log"
@@ -485,7 +546,7 @@ install_and_configure_fail2ban() {
 }
 
 show_fail2ban_status_detail() {
-    local cfg_file="${FAIL2BAN_SSH_JAIL_FILE:-/etc/fail2ban/jail.d/vps-init-suite-sshd.local}"
+    local cfg_file="${FAIL2BAN_SSH_JAIL_FILE:-/etc/fail2ban/jail.local}"
     local service_active="未知" service_enabled="未知" server_ping="失败"
     local config_check="未执行" jails="" sshd_loaded="否" effective="否"
     local cfg_port="未配置" cfg_backend="未配置" cfg_banaction="未配置"
@@ -513,9 +574,9 @@ show_fail2ban_status_detail() {
     fail2ban-client -d >/dev/null 2>&1 && config_check="通过" || config_check="失败"
 
     if [ -f "$cfg_file" ]; then
-        cfg_port=$(awk -F= '/^[[:space:]]*port[[:space:]]*=/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' "$cfg_file" | tail -n 1)
-        cfg_backend=$(awk -F= '/^[[:space:]]*backend[[:space:]]*=/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' "$cfg_file" | tail -n 1)
-        cfg_banaction=$(awk -F= '/^[[:space:]]*banaction[[:space:]]*=/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' "$cfg_file" | tail -n 1)
+        cfg_port=$(awk -F= '/^[[:space:]]*#/ {next} /^[[:space:]]*port[[:space:]]*=/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' "$cfg_file" | tail -n 1)
+        cfg_backend=$(awk -F= '/^[[:space:]]*#/ {next} /^[[:space:]]*backend[[:space:]]*=/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' "$cfg_file" | tail -n 1)
+        cfg_banaction=$(awk -F= '/^[[:space:]]*#/ {next} /^[[:space:]]*banaction[[:space:]]*=/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' "$cfg_file" | tail -n 1)
         cfg_port=${cfg_port:-未配置}
         cfg_backend=${cfg_backend:-未配置}
         cfg_banaction=${cfg_banaction:-未配置}
